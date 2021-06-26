@@ -1,0 +1,14 @@
+#Android
+bin\gn.exe gen out/arm64 --args='ndk=\"C:/Users/aloni/AppData/Local/Android/Sdk/ndk/22.1.7171670\" target_cpu=\"arm64\"'
+bin\gn.exe gen out/arm64-Shared --args='ndk=\"C:/Users/aloni/AppData/Local/Android/Sdk/ndk/22.1.7171670\" target_cpu=\"arm64\" is_component_build=true'
+bin\gn.exe gen out/arm-Shared --args='ndk=\"C:/Users/aloni/AppData/Local/Android/Sdk/ndk/22.1.7171670\" target_cpu=\"arm\" is_component_build=true'
+bin\gn.exe gen out/android-x64-Shared --args='ndk=\"C:/Users/aloni/AppData/Local/Android/Sdk/ndk/22.1.7171670\" target_cpu=\"x64\" is_component_build=true'
+bin\gn.exe gen out/android-x86-Shared --args='ndk=\"C:/Users/aloni/AppData/Local/Android/Sdk/ndk/22.1.7171670\" target_cpu=\"x86\" is_component_build=true'
+
+# Windows
+bin/gn gen out/Release-VS --ide=vs --args='is_debug=false skia_use_direct3d=true'
+bin/gn gen out/WinDebug  --args='is_debug=true extra_cflags=[\"/MDd\"]'
+bin/gn gen out/WinRelease  --args='is_debug=false extra_cflags=[\"/MD\"]'
+
+
+_JAVA_OPTIONS  -Xmx4G -Xms512M
