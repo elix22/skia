@@ -9,6 +9,7 @@
 
 #include "include/private/SkVx.h"
 #include "src/gpu/GrMeshDrawTarget.h"
+#include "src/gpu/GrResourceProvider.h"
 #include "src/gpu/SkGr.h"
 #include "src/gpu/geometry/GrQuadUtils.h"
 #include "src/gpu/glsl/GrGLSLColorSpaceXformHelper.h"
@@ -244,10 +245,10 @@ static void write_2d_cov_uv_strict(GrVertexWriter* vb, const GrQuadPerEdgeAA::Ve
 
 namespace GrQuadPerEdgeAA {
 
-IndexBufferOption CalcIndexBufferOption(GrAAType aa, int numQuads, const GrCaps& caps) {
+IndexBufferOption CalcIndexBufferOption(GrAAType aa, int numQuads) {
     if (aa == GrAAType::kCoverage) {
         return IndexBufferOption::kPictureFramed;
-    } else if (numQuads > 1 || caps.alwaysDrawQuadsIndexed()) {
+    } else if (numQuads > 1) {
         return IndexBufferOption::kIndexedRects;
     } else {
         return IndexBufferOption::kTriStrips;

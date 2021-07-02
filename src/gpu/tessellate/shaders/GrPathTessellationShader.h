@@ -54,6 +54,42 @@ public:
                                                                    const SkMatrix& viewMatrix,
                                                                    const SkPMColor4f&, PatchType);
 
+    // This is the largest number of segments the middle-out shader will accept in a single
+    // instance. If a curve requires more segments, it needs to be chopped.
+    constexpr static int kMaxFixedCountSegments = 32;
+    constexpr static int kMaxFixedCountResolveLevel = 5;  // log2(kMaxFixedCountSegments)
+    static_assert(kMaxFixedCountSegments == 1 << kMaxFixedCountResolveLevel);
+
+    // These functions define the vertex and index buffers that should be bound when drawing with
+    // the middle-out fixed count shader. The data sequence is identical for any length of
+    // tessellation segments, so the caller can use them with any instance length (up to
+    // kMaxFixedCountResolveLevel).
+    //
+    // The "curve" and "wedge" buffers are nearly identical, but we keep them separate for now in
+    // case there is a perf hit in the curve case for not using index 0.
+    constexpr static int SizeOfVertexBufferForMiddleOutCurves() {
+        constexpr int kMaxVertexCount = (1 << kMaxFixedCountResolveLevel) + 1;
+        return kMaxVertexCount * kMiddleOutVertexStride;
+    }
+    static void InitializeVertexBufferForMiddleOutCurves(GrVertexWriter, size_t bufferSize);
+
+    constexpr static size_t SizeOfIndexBufferForMiddleOutCurves() {
+        constexpr int kMaxTriangleCount =
+                NumCurveTrianglesAtResolveLevel(kMaxFixedCountResolveLevel);
+        return kMaxTriangleCount * 3 * sizeof(uint16_t);
+    }
+    static void InitializeIndexBufferForMiddleOutCurves(GrVertexWriter, size_t bufferSize);
+
+    constexpr static int SizeOfVertexBufferForMiddleOutWedges() {
+        return SizeOfVertexBufferForMiddleOutCurves() + kMiddleOutVertexStride;
+    }
+    static void InitializeVertexBufferForMiddleOutWedges(GrVertexWriter, size_t bufferSize);
+
+    constexpr static size_t SizeOfIndexBufferForMiddleOutWedges() {
+        return SizeOfIndexBufferForMiddleOutCurves() + 3 * sizeof(uint16_t);
+    }
+    static void InitializeIndexBufferForMiddleOutWedges(GrVertexWriter, size_t bufferSize);
+
     // Uses GPU tessellation shaders to linearize, triangulate, and render cubic "wedge" patches. A
     // wedge is a 5-point patch consisting of 4 cubic control points, plus an anchor point fanning
     // from the center of the curve's resident contour.
@@ -62,7 +98,7 @@ public:
                                                                     const SkPMColor4f&, PatchType);
 
     // Returns the stencil settings to use for a standard Redbook "stencil" pass.
-    static const GrUserStencilSettings* StencilPathSettings(SkPathFillType fillType) {
+    static const GrUserStencilSettings* StencilPathSettings(GrFillRule fillRule) {
         // Increments clockwise triangles and decrements counterclockwise. Used for "winding" fill.
         constexpr static GrUserStencilSettings kIncrDecrStencil(
             GrUserStencilSettings::StaticInitSeparate<
@@ -83,14 +119,13 @@ public:
                 GrUserStencilOp::kKeep,
                 0x0001>());
 
-        SkASSERT(fillType == SkPathFillType::kWinding || fillType == SkPathFillType::kEvenOdd);
-        return (fillType == SkPathFillType::kWinding) ? &kIncrDecrStencil : &kInvertStencil;
+        return (fillRule == GrFillRule::kNonzero) ? &kIncrDecrStencil : &kInvertStencil;
     }
 
     // Returns the stencil settings to use for a standard Redbook "fill" pass. Allows non-zero
     // stencil values to pass and write a color, and resets the stencil value back to zero; discards
     // immediately on stencil values of zero.
-    static const GrUserStencilSettings* TestAndResetStencilSettings() {
+    static const GrUserStencilSettings* TestAndResetStencilSettings(bool isInverseFill = false) {
         constexpr static GrUserStencilSettings kTestAndResetStencil(
             GrUserStencilSettings::StaticInit<
                 0x0000,
@@ -101,7 +136,19 @@ public:
                 GrUserStencilOp::kZero,
                 GrUserStencilOp::kKeep,
                 0xffff>());
-        return &kTestAndResetStencil;
+
+        constexpr static GrUserStencilSettings kTestAndResetStencilInverted(
+            GrUserStencilSettings::StaticInit<
+                0x0000,
+                // No need to check the clip because the previous stencil pass will have only
+                // written to samples already inside the clip.
+                GrUserStencilTest::kEqual,
+                0xffff,
+                GrUserStencilOp::kKeep,
+                GrUserStencilOp::kZero,
+                0xffff>());
+
+        return isInverseFill ? &kTestAndResetStencilInverted : &kTestAndResetStencil;
     }
 
     // Creates a pipeline that does not write to the color buffer.
@@ -123,6 +170,8 @@ public:
     }
 
 protected:
+    constexpr static size_t kMiddleOutVertexStride = 2 * sizeof(float);
+
     GrPathTessellationShader(ClassID classID, GrPrimitiveType primitiveType,
                              int tessellationPatchVertexCount, const SkMatrix& viewMatrix,
                              const SkPMColor4f& color)
@@ -138,11 +187,6 @@ protected:
                      const GrGeometryProcessor&) override;
 
     protected:
-        // float2 eval_rational_cubic(float4x3 P, float T) { ...
-        //
-        // Converts a 4-point input patch into the rational cubic it intended to represent.
-        static const char* kUnpackRationalCubicFn;
-
         // float4x3 unpack_rational_cubic(float2 p0, float2 p1, float2 p2, float2 p3) { ...
         //
         // Evaluate our point of interest using numerically stable linear interpolations. We add our
@@ -151,8 +195,8 @@ protected:
         // does not always.
         static const char* kEvalRationalCubicFn;
 
-        virtual void emitVertexCode(const GrPathTessellationShader&, GrGLSLVertexBuilder*,
-                                    GrGPArgs*) = 0;
+        virtual void emitVertexCode(const GrShaderCaps&, const GrPathTessellationShader&,
+                                    GrGLSLVertexBuilder*, GrGPArgs*) = 0;
 
         GrGLSLUniformHandler::UniformHandle fAffineMatrixUniform;
         GrGLSLUniformHandler::UniformHandle fTranslateUniform;

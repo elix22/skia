@@ -72,7 +72,7 @@
 #include "src/gpu/text/GrSDFTControl.h"
 #include "src/gpu/text/GrTextBlobCache.h"
 
-#if GR_OGA
+#if SK_GPU_V1
 #include "src/gpu/GrPathRenderer.h"
 #endif
 
@@ -298,10 +298,10 @@ void GrSurfaceDrawContext::willReplaceOpsTask(GrOpsTask* prevTask, GrOpsTask* ne
 
 inline GrAAType GrSurfaceDrawContext::chooseAAType(GrAA aa) {
     if (fCanUseDynamicMSAA) {
-        // Trigger dmsaa by default if the render target has it. Coverage ops that know how to
-        // handle both single and multisample targets without popping will do so without calling
-        // chooseAAType.
-        return GrAAType::kMSAA;
+        // Use coverage AA if we can disable multisample. Otherwise always trigger dmsaa. The few
+        // coverage ops we have that know how to handle both single and multisample targets without
+        // popping will do so without calling chooseAAType.
+        return this->caps()->multisampleDisableSupport() ? GrAAType::kCoverage : GrAAType::kMSAA;
     }
     if (GrAA::kNo == aa) {
         // On some devices we cannot disable MSAA if it is enabled so we make the AA type reflect
@@ -730,7 +730,7 @@ void GrSurfaceDrawContext::drawRect(const GrClip* clip,
                !this->caps()->reducedShaderMode()) {
         // Only use the StrokeRectOp for non-empty rectangles. Empty rectangles will be processed by
         // GrStyledShape to handle stroke caps and dashing properly.
-        GrAAType aaType = (fCanUseDynamicMSAA) ? GrAAType::kCoverage : this->chooseAAType(aa);
+        GrAAType aaType = this->chooseAAType(aa);
         GrOp::Owner op = GrStrokeRectOp::Make(
                 fContext, std::move(paint), aaType, viewMatrix, rect, stroke);
         // op may be null if the stroke is not supported or if using coverage aa and the view matrix
@@ -879,7 +879,7 @@ bool GrSurfaceDrawContext::stencilPath(const GrHardClip* clip,
                                        GrAA doStencilMSAA,
                                        const SkMatrix& viewMatrix,
                                        const SkPath& path) {
-#if GR_OGA
+#if SK_GPU_V1
     SkIRect clipBounds = clip ? clip->getConservativeBounds()
                               : SkIRect::MakeSize(this->dimensions());
     GrStyledShape shape(path, GrStyledShape::DoSimplify::kNo);
@@ -913,7 +913,7 @@ bool GrSurfaceDrawContext::stencilPath(const GrHardClip* clip,
     return true;
 #else
     return false;
-#endif // GR_OGA
+#endif // SK_GPU_V1
 }
 
 void GrSurfaceDrawContext::drawTextureSet(const GrClip* clip,
@@ -957,7 +957,7 @@ void GrSurfaceDrawContext::drawVertices(const GrClip* clip,
     AutoCheckFlush acf(this->drawingManager());
 
     SkASSERT(vertices);
-    GrAAType aaType = this->chooseAAType(GrAA::kNo);
+    GrAAType aaType = fCanUseDynamicMSAA ? GrAAType::kMSAA : this->chooseAAType(GrAA::kNo);
     GrOp::Owner op =
             GrDrawVerticesOp::Make(fContext, std::move(paint), std::move(vertices), matrixProvider,
                                    aaType, this->colorInfo().refColorSpaceXformFromSRGB(),
@@ -1049,28 +1049,28 @@ void GrSurfaceDrawContext::drawRRect(const GrClip* origClip,
     AutoCheckFlush acf(this->drawingManager());
 
     GrAAType aaType = this->chooseAAType(aa);
-    bool preferFillRRectOverCircle = aaType == GrAAType::kCoverage        &&
-                                     this->caps()->drawInstancedSupport() &&
-                                     this->caps()->reducedShaderMode();
 
     GrOp::Owner op;
-    if (!preferFillRRectOverCircle                             &&
-        GrAAType::kCoverage == aaType                          &&
-        rrect.isSimple()                                       &&
-        rrect.getSimpleRadii().fX == rrect.getSimpleRadii().fY &&
-        viewMatrix.rectStaysRect() && viewMatrix.isSimilarity()) {
-        // In coverage mode, we draw axis-aligned circular roundrects with the GrOvalOpFactory
-        // to avoid perf regressions on some platforms.
-        assert_alive(paint);
-        op = GrOvalOpFactory::MakeCircularRRectOp(
-                fContext, std::move(paint), viewMatrix, rrect, stroke, this->caps()->shaderCaps());
+    if (aaType == GrAAType::kCoverage) {
+        bool preferFillRRectOverCircle = this->caps()->drawInstancedSupport() &&
+                                         (fCanUseDynamicMSAA || this->caps()->reducedShaderMode());
+        if (!preferFillRRectOverCircle                             &&
+            rrect.isSimple()                                       &&
+            rrect.getSimpleRadii().fX == rrect.getSimpleRadii().fY &&
+            viewMatrix.rectStaysRect() && viewMatrix.isSimilarity()) {
+            // In coverage mode, we draw axis-aligned circular roundrects with the GrOvalOpFactory
+            // to avoid perf regressions on some platforms.
+            assert_alive(paint);
+            op = GrOvalOpFactory::MakeCircularRRectOp(fContext, std::move(paint), viewMatrix, rrect,
+                                                      stroke, this->caps()->shaderCaps());
+        }
     }
     if (!op && style.isSimpleFill()) {
         assert_alive(paint);
         op = GrFillRRectOp::Make(fContext, std::move(paint), viewMatrix, rrect, rrect.rect(),
                                  GrAA(aaType != GrAAType::kNone));
     }
-    if (!op && (GrAAType::kCoverage == aaType || fCanUseDynamicMSAA)) {
+    if (!op && aaType == GrAAType::kCoverage) {
         assert_alive(paint);
         op = GrOvalOpFactory::MakeRRectOp(
                 fContext, std::move(paint), viewMatrix, rrect, stroke, this->caps()->shaderCaps());
@@ -1325,9 +1325,11 @@ void GrSurfaceDrawContext::drawRegion(const GrClip* clip,
         return this->drawPath(clip, std::move(paint), aa, viewMatrix, path, style);
     }
 
-    GrAAType aaType = this->chooseAAType(GrAA::kNo);
-    GrOp::Owner op = GrRegionOp::Make(fContext, std::move(paint), viewMatrix, region,
-                                      aaType, ss);
+    GrAAType aaType = (this->numSamples() > 1 &&
+                       !this->caps()->multisampleDisableSupport())
+                    ? GrAAType::kMSAA
+                    : GrAAType::kNone;
+    GrOp::Owner op = GrRegionOp::Make(fContext, std::move(paint), viewMatrix, region, aaType, ss);
     this->addDrawOp(clip, std::move(op));
 }
 
@@ -1357,21 +1359,20 @@ void GrSurfaceDrawContext::drawOval(const GrClip* clip,
 
     GrAAType aaType = this->chooseAAType(aa);
 
-    bool preferFillRRectOverCircle = aaType == GrAAType::kCoverage        &&
-                                     this->caps()->drawInstancedSupport() &&
-                                     this->caps()->reducedShaderMode();
-
     GrOp::Owner op;
-    if (!preferFillRRectOverCircle         &&
-        GrAAType::kCoverage == aaType      &&
-        oval.width() > SK_ScalarNearlyZero &&
-        oval.width() == oval.height()      &&
-        viewMatrix.isSimilarity()) {
-        // We don't draw true circles as round rects in coverage mode, because it can
-        // cause perf regressions on some platforms as compared to the dedicated circle Op.
-        assert_alive(paint);
-        op = GrOvalOpFactory::MakeCircleOp(fContext, std::move(paint), viewMatrix, oval, style,
-                                           this->caps()->shaderCaps());
+    if (aaType == GrAAType::kCoverage) {
+        bool preferFillRRectOverCircle = this->caps()->drawInstancedSupport() &&
+                                         (fCanUseDynamicMSAA || this->caps()->reducedShaderMode());
+        if (!preferFillRRectOverCircle         &&
+            oval.width() > SK_ScalarNearlyZero &&
+            oval.width() == oval.height()      &&
+            viewMatrix.isSimilarity()) {
+            // We don't draw true circles as round rects in coverage mode, because it can
+            // cause perf regressions on some platforms as compared to the dedicated circle Op.
+            assert_alive(paint);
+            op = GrOvalOpFactory::MakeCircleOp(fContext, std::move(paint), viewMatrix, oval, style,
+                                               this->caps()->shaderCaps());
+        }
     }
     if (!op && style.isSimpleFill()) {
         // GrFillRRectOp has special geometry and a fragment-shader branch to conditionally evaluate
@@ -1383,7 +1384,7 @@ void GrSurfaceDrawContext::drawOval(const GrClip* clip,
         op = GrFillRRectOp::Make(fContext, std::move(paint), viewMatrix, SkRRect::MakeOval(oval),
                                  oval, GrAA(aaType != GrAAType::kNone));
     }
-    if (!op && (GrAAType::kCoverage == aaType || fCanUseDynamicMSAA)) {
+    if (!op && aaType == GrAAType::kCoverage) {
         assert_alive(paint);
         op = GrOvalOpFactory::MakeOvalOp(fContext, std::move(paint), viewMatrix, oval, style,
                                          this->caps()->shaderCaps());
@@ -1416,7 +1417,7 @@ void GrSurfaceDrawContext::drawArc(const GrClip* clip,
     AutoCheckFlush acf(this->drawingManager());
 
     GrAAType aaType = this->chooseAAType(aa);
-    if (GrAAType::kCoverage == aaType || fCanUseDynamicMSAA) {
+    if (aaType == GrAAType::kCoverage) {
         const GrShaderCaps* shaderCaps = this->caps()->shaderCaps();
         GrOp::Owner op = GrOvalOpFactory::MakeArcOp(fContext,
                                                     std::move(paint),
@@ -1494,8 +1495,9 @@ bool GrSurfaceDrawContext::waitOnSemaphores(int numSemaphores,
     std::unique_ptr<std::unique_ptr<GrSemaphore>[]> grSemaphores(
             new std::unique_ptr<GrSemaphore>[numSemaphores]);
     for (int i = 0; i < numSemaphores; ++i) {
-        grSemaphores[i] = resourceProvider->wrapBackendSemaphore(
-                waitSemaphores[i], GrResourceProvider::SemaphoreWrapType::kWillWait, ownership);
+        grSemaphores[i] = resourceProvider->wrapBackendSemaphore(waitSemaphores[i],
+                                                                 GrSemaphoreWrapType::kWillWait,
+                                                                 ownership);
     }
     this->drawingManager()->newWaitRenderTask(this->asSurfaceProxyRef(), std::move(grSemaphores),
                                               numSemaphores);
@@ -1541,11 +1543,11 @@ void GrSurfaceDrawContext::drawShape(const GrClip* clip,
                                      /* attemptDrawSimple */ true);
 }
 
-#if GR_OGA
+#if SK_GPU_V1
 static SkIRect get_clip_bounds(const GrSurfaceDrawContext* rtc, const GrClip* clip) {
     return clip ? clip->getConservativeBounds() : SkIRect::MakeWH(rtc->width(), rtc->height());
 }
-#endif // GR_OGA
+#endif // SK_GPU_V1
 
 bool GrSurfaceDrawContext::drawAndStencilPath(const GrHardClip* clip,
                                               const GrUserStencilSettings* ss,
@@ -1554,7 +1556,7 @@ bool GrSurfaceDrawContext::drawAndStencilPath(const GrHardClip* clip,
                                               GrAA aa,
                                               const SkMatrix& viewMatrix,
                                               const SkPath& path) {
-#if GR_OGA
+#if SK_GPU_V1
     ASSERT_SINGLE_OWNER
     RETURN_FALSE_IF_ABANDONED
     SkDEBUGCODE(this->validate();)
@@ -1739,7 +1741,7 @@ void GrSurfaceDrawContext::drawShapeUsingPathRenderer(const GrClip* clip,
                                                       const SkMatrix& viewMatrix,
                                                       GrStyledShape&& shape,
                                                       bool attemptDrawSimple) {
-#if GR_OGA
+#if SK_GPU_V1
     ASSERT_SINGLE_OWNER
     RETURN_IF_ABANDONED
     GR_CREATE_TRACE_MARKER_CONTEXT("GrSurfaceDrawContext", "internalDrawPath", fContext);
@@ -1750,7 +1752,8 @@ void GrSurfaceDrawContext::drawShapeUsingPathRenderer(const GrClip* clip,
 
     SkIRect clipConservativeBounds = get_clip_bounds(this, clip);
 
-    GrAAType aaType = this->chooseAAType(aa);
+    // Always allow paths to trigger DMSAA.
+    GrAAType aaType = fCanUseDynamicMSAA ? GrAAType::kMSAA : this->chooseAAType(aa);
 
     GrPathRenderer::CanDrawPathArgs canDrawArgs;
     canDrawArgs.fCaps = this->caps();
